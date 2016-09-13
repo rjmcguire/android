@@ -12,27 +12,27 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
  */
 
-import android_native_app_glue;
-
-import core.sys.posix.sys.time, core.sys.posix.time : clock_gettime, CLOCK_MONOTONIC;
-import android.log : __android_log_print, android_LogPriority;
-import android.native_window;
-import android.input, android.looper : ALooper_pollAll;
+import jni;
+import core.runtime : rt_init;
+import core.sys.posix.sys.time : gettimeofday, timeval;
+import android.bitmap, android.log : __android_log_print, android_LogPriority;
 
 import core.stdc.stdint, core.stdc.math: sin;
 import core.stdc.stdarg : va_list, va_start;
-import core.stdc.string : memset;
 
 enum LOG_TAG = "libplasma";
-int LOGI(const(char)* fmt, ...) { 
+int LOGI(const(char)* fmt, ...) {
     va_list arg_list;
     va_start(arg_list, fmt);
-    return __android_log_print(android_LogPriority.ANDROID_LOG_INFO, LOG_TAG, arg_list);
+    return __android_log_print(android_LogPriority.ANDROID_LOG_INFO, LOG_TAG, fmt, arg_list);
 }
-int LOGW(const(char)* warning) { return  __android_log_print(android_LogPriority.ANDROID_LOG_WARN, LOG_TAG, warning); }
+int LOGE(const(char)* fmt, ...) {
+    va_list arg_list;
+    va_start(arg_list, fmt);
+    return __android_log_print(android_LogPriority.ANDROID_LOG_ERROR, LOG_TAG, fmt, arg_list);
+}
 
 /* Set to 1 to enable debug log traces. */
 enum DEBUG = 0;
@@ -118,7 +118,7 @@ Fixed  fixed_cos( Fixed  f )
 enum PALETTE_BITS = 8;
 enum PALETTE_SIZE = 1 << PALETTE_BITS;
 
-static assert(PALETTE_BITS <= FIXED_BITS, "PALETTE_BITS must be smaller than FIXED_BITS"); 
+static assert(PALETTE_BITS <= FIXED_BITS, "PALETTE_BITS must be smaller than FIXED_BITS");
 
 uint16_t[PALETTE_SIZE] palette;
 
@@ -170,7 +170,7 @@ void init_tables()
     init_angles();
 }
 
-void fill_plasma(ANativeWindow_Buffer* buffer, double  t)
+void fill_plasma( AndroidBitmapInfo*  info, void*  pixels, double  t )
 {
     Fixed yt1 = FIXED_FROM_FLOAT(t/1230.);
     Fixed yt2 = yt1;
@@ -180,12 +180,8 @@ void fill_plasma(ANativeWindow_Buffer* buffer, double  t)
     enum YT1_INCR = FIXED_FROM_FLOAT(1/100.);
     enum YT2_INCR = FIXED_FROM_FLOAT(1/163.);
 
-    void* pixels = buffer.bits;
-    //LOGI("width=%d height=%d stride=%d format=%d", buffer->width, buffer->height,
-    //        buffer->stride, buffer->format);
-
     int  yy;
-    for (yy = 0; yy < buffer.height; yy++) {
+    for (yy = 0; yy < info.height; yy++) {
         uint16_t*  line = cast(uint16_t*)pixels;
         Fixed      base = fixed_sin(yt1) + fixed_sin(yt2);
         Fixed      xt1 = xt10;
@@ -201,7 +197,7 @@ void fill_plasma(ANativeWindow_Buffer* buffer, double  t)
         /* optimize memory writes by generating one aligned 32-bit store
          * for every pair of pixels.
          */
-        uint16_t*  line_end = line + buffer.width;
+        uint16_t*  line_end = line + info.width;
 
         if (line < line_end) {
             if ((cast(uint32_t)line & 3) != 0) {
@@ -238,7 +234,7 @@ void fill_plasma(ANativeWindow_Buffer* buffer, double  t)
         }
         } else {/* !OPTIMIZE_WRITES */
         int xx;
-        for (xx = 0; xx < buffer.width; xx++) {
+        for (xx = 0; xx < info.width; xx++) {
 
             Fixed ii = base + fixed_sin(xt1) + fixed_sin(xt2);
 
@@ -250,7 +246,7 @@ void fill_plasma(ANativeWindow_Buffer* buffer, double  t)
         }/* !OPTIMIZE_WRITES */
 
         // go to next line
-        pixels = cast(uint16_t*)pixels + buffer.stride;
+        pixels = cast(char*)pixels + info.stride;
     }
 }
 
@@ -349,133 +345,42 @@ stats_endFrame( Stats*  s )
     s.lastTime = now;
 }
 
-// ----------------------------------------------------------------------
-
-struct engine {
-    android_app* app;
-
-    Stats stats;
-
-    int animating;
-}
-
-void engine_draw_frame(engine* engine) {
-    if (engine.app.window == null) {
-        // No window.
-        return;
-    }
-
-    ANativeWindow_Buffer buffer;
-    if (ANativeWindow_lock(engine.app.window, &buffer, null) < 0) {
-        LOGW("Unable to lock window buffer");
-        return;
-    }
-
-    stats_startFrame(&engine.stats);
-
-    timespec t;
-    t.tv_sec = t.tv_nsec = 0;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    int64_t time_ms = ((cast(int64_t)t.tv_sec)*1_000_000_000L + t.tv_nsec)/1_000_000;
-
-    /* Now fill the values with a nice little plasma */
-    fill_plasma(&buffer, time_ms);
-
-    ANativeWindow_unlockAndPost(engine.app.window);
-
-    stats_endFrame(&engine.stats);
-}
-
-void engine_term_display(engine* engine) {
-    engine.animating = 0;
-}
-
-int32_t engine_handle_input(android_app* app, AInputEvent* event) {
-    engine* engine = cast(engine*)app.userData;
-    if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION) {
-        engine.animating = 1;
-        return 1;
-    } else if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY) {
-        LOGI("Key event: action=%d keyCode=%d metaState=0x%x",
-                AKeyEvent_getAction(event),
-                AKeyEvent_getKeyCode(event),
-                AKeyEvent_getMetaState(event));
-    }
-
-    return 0;
-}
-
-void engine_handle_cmd(android_app* app, int32_t cmd) {
-    engine* engine = cast(engine*)app.userData;
-    switch (cmd) {
-        case APP_CMD_INIT_WINDOW:
-            if (engine.app.window != null) {
-                engine_draw_frame(engine);
-            }
-            break;
-        case APP_CMD_TERM_WINDOW:
-            engine_term_display(engine);
-            break;
-        case APP_CMD_LOST_FOCUS:
-            engine.animating = 0;
-            engine_draw_frame(engine);
-            break;
-        default:
-            break;
-    }
-}
-
 void main(){}
-extern(C) void android_main(android_app* state) {
-    static int init;
+extern(C) void Java_com_example_plasma_PlasmaView_renderPlasma(JNIEnv * env, jobject  obj, jobject bitmap,  jlong  time_ms)
+{
+    AndroidBitmapInfo  info;
+    void*              pixels;
+    int                ret;
+    static Stats       stats;
+    static int         init;
 
-    engine engine;
-
-    // Make sure glue isn't stripped.
-    app_dummy();
-
-    memset(&engine, 0, engine.sizeof);
-    state.userData = &engine;
-    state.onAppCmd = &engine_handle_cmd;
-    state.onInputEvent = &engine_handle_input;
-    engine.app = state;
-
+    rt_init();
     if (!init) {
         init_tables();
+        stats_init(&stats);
         init = 1;
     }
 
-    stats_init(&engine.stats);
-
-    // loop waiting for stuff to do.
-
-    while (1) {
-        // Read all pending events.
-        int ident;
-        int events;
-        android_poll_source* source;
-
-        // If not animating, we will block forever waiting for events.
-        // If animating, we loop until all events are read, then continue
-        // to draw the next frame of animation.
-        while ((ident=ALooper_pollAll(engine.animating ? 0 : -1, null, &events,
-                cast(void**)&source)) >= 0) {
-
-            // Process this event.
-            if (source != null) {
-                source.process(state, source);
-            }
-
-            // Check if we are exiting.
-            if (state.destroyRequested != 0) {
-                LOGI("Engine thread destroy requested!");
-                engine_term_display(&engine);
-                return;
-            }
-        }
-
-        if (engine.animating) {
-            engine_draw_frame(&engine);
-        }
+    if ((ret = AndroidBitmap_getInfo(env, bitmap, &info)) < 0) {
+        LOGE("AndroidBitmap_getInfo() failed ! error=%d", ret);
+        return;
     }
+
+    if (info.format != AndroidBitmapFormat.ANDROID_BITMAP_FORMAT_RGB_565) {
+        LOGE("Bitmap format is not RGB_565 !");
+        return;
+    }
+
+    if ((ret = AndroidBitmap_lockPixels(env, bitmap, &pixels)) < 0) {
+        LOGE("AndroidBitmap_lockPixels() failed ! error=%d", ret);
+    }
+
+    stats_startFrame(&stats);
+
+    /* Now fill the values with a nice little plasma */
+    fill_plasma(&info, pixels, time_ms );
+
+    AndroidBitmap_unlockPixels(env, bitmap);
+
+    stats_endFrame(&stats);
 }
